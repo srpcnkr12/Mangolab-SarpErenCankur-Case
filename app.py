@@ -236,7 +236,7 @@ def _build_response(amount: float, base: str, target: str, rate: float,
     result = (Decimal(str(amount)) * Decimal(str(rate))).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
-    return {
+    body = {
         "amount": amount,
         "from": base,
         "to": target,
@@ -246,6 +246,17 @@ def _build_response(amount: float, base: str, target: str, rate: float,
         "asked_date": asked_date.isoformat(),
         "source": SOURCE,
     }
+    if rate_date != asked_date:
+        # The ECB published no rate for the date asked (weekend, holiday, or not
+        # published yet today). We answer with the most recent earlier rate and
+        # say so plainly, so the model can tell the customer which day it is from.
+        days = (asked_date - rate_date).days
+        earlier = f" ({days} day{'s' if days != 1 else ''} earlier)" if days > 0 else ""
+        body["notice"] = (
+            f"No ECB rate was published for {asked_date.isoformat()}; "
+            f"using the rate from {rate_date.isoformat()}{earlier}."
+        )
+    return body
 
 
 @app.get("/tools/convert")
