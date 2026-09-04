@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
@@ -55,6 +56,11 @@ def _upstream_prefix() -> str:
 
 def _upstream_timeout() -> float:
     return float(os.environ.get("FX_UPSTREAM_TIMEOUT", "5"))
+
+
+def _cache_ttl() -> float:
+    """Seconds a ``latest``/today rate stays cached. Past dates never expire."""
+    return float(os.environ.get("FX_CACHE_TTL", "3600"))
 
 
 def _upstream_url(path: str) -> str:
@@ -148,28 +154,68 @@ def _validation_message(exc: RequestValidationError) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Cache
+# --------------------------------------------------------------------------- #
+#
+# ECB reference rates are published once per working day, not streamed, so a
+# rate for a past date never changes and "latest" changes at most daily. We key
+# on (base, target, date) only -- independent of amount -- so "250 EUR->TRY on
+# 2026-08-28" and "1000 EUR->TRY on 2026-08-28" share one upstream call, and we
+# store every answer under both the date asked and the date the rate belongs to,
+# so "latest", an explicit today, and the resolved date all collapse to one hit.
+
+_MISSING = object()  # sentinel: the ECB has no rate for this past date
+
+# (base, target, "YYYY-MM-DD"|"latest") -> ((rate, rate_date) | _MISSING, expires_at)
+_rate_cache: dict[tuple[str, str, str], tuple[object, float]] = {}
+
+
+def _cache_get(base: str, target: str, key: str):
+    entry = _rate_cache.get((base, target, key))
+    if entry is None:
+        return None
+    value, expires_at = entry
+    if expires_at < time.monotonic():
+        _rate_cache.pop((base, target, key), None)
+        return None
+    return value
+
+
+def _cache_put(base: str, target: str, key: str, value: object) -> None:
+    immutable = key != "latest" and date.fromisoformat(key) < date.today()
+    expires_at = math.inf if immutable else time.monotonic() + _cache_ttl()
+    _rate_cache[(base, target, key)] = (value, expires_at)
+
+
+# --------------------------------------------------------------------------- #
 # Upstream
 # --------------------------------------------------------------------------- #
 
 _known_currencies: set[str] | None = None
+_currencies_retry_at: float = 0.0
 
 
 async def known_currencies() -> set[str] | None:
     """The ECB currency codes, cached for the process lifetime.
 
-    Returns ``None`` if the list cannot be fetched, so the caller falls back to
-    letting the rate request surface the error instead of guessing.
+    Returns ``None`` if the list cannot be fetched (a failure is remembered for
+    60 s), so the caller falls back to letting the rate request surface the
+    error instead of guessing.
     """
-    global _known_currencies
-    if _known_currencies is None:
-        try:
-            response = await _http().get(_upstream_url("currencies"))
-            response.raise_for_status()
-            _known_currencies = {code.upper() for code in response.json()}
-        except Exception:
-            logger.warning("could not fetch the currency list", exc_info=True)
-            return None
-    return _known_currencies
+    global _known_currencies, _currencies_retry_at
+    if _known_currencies is not None:
+        return _known_currencies
+    if time.monotonic() < _currencies_retry_at:
+        return None
+    try:
+        response = await _http().get(_upstream_url("currencies"))
+        response.raise_for_status()
+        _known_currencies = {code.upper() for code in response.json()}
+        return _known_currencies
+    except Exception:
+        logger.warning("could not fetch the currency list", exc_info=True)
+        _currencies_retry_at = time.monotonic() + 60
+        return None
 
 
 def _no_rate_message(on: date | None) -> str:
@@ -189,8 +235,14 @@ async def fetch_rate(base: str, target: str, on: date | None) -> tuple[float, da
     ``rate_date`` is taken from the upstream's own ``date`` field — the day the
     rate actually belongs to, which is not always the day that was asked for.
     """
-    path = on.isoformat() if on else "latest"
-    url = _upstream_url(path)
+    asked_key = on.isoformat() if on else "latest"
+    cached = _cache_get(base, target, asked_key)
+    if cached is _MISSING:
+        raise FxError(404, "no_rate_available", _no_rate_message(on))
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    url = _upstream_url(asked_key)
     params = {"base": base, "symbols": target}
 
     try:
@@ -205,6 +257,10 @@ async def fetch_rate(base: str, target: str, on: date | None) -> tuple[float, da
                       "Could not reach the exchange-rate service.")
 
     if response.status_code == 404:
+        # A well-formed, non-future date the ECB never covered: immutable, so
+        # remember it and do not re-ask. (Transient failures below are not cached.)
+        if on is not None and on < date.today():
+            _cache_put(base, target, asked_key, _MISSING)
         raise FxError(404, "no_rate_available", _no_rate_message(on))
     if response.status_code >= 500:
         logger.warning("upstream returned %s for %s", response.status_code, url)
@@ -224,7 +280,10 @@ async def fetch_rate(base: str, target: str, on: date | None) -> tuple[float, da
         raise FxError(502, "upstream_bad_response",
                       "The exchange-rate service returned an unexpected response.")
 
-    return rate, rate_date
+    value = (rate, rate_date)
+    _cache_put(base, target, asked_key, value)
+    _cache_put(base, target, rate_date.isoformat(), value)
+    return value
 
 
 # --------------------------------------------------------------------------- #
